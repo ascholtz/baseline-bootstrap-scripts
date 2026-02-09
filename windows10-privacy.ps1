@@ -61,22 +61,81 @@ Write-Host "All privacy settings have been set to OFF/NO. Restart your PC to com
 
 # ----------------------------------------------------------------------------------------------------------------------
 
-# Define the registry settings to apply
+# 1. Map the HKU drive
+if (-not (Get-PSDrive -Name HKU -ErrorAction SilentlyContinue)) {
+    New-PSDrive -PSProvider Registry -Name HKU -Root HKEY_USERS
+}
+
+# Define the registry settings
 $RegistrySettings = @(
     @{ Path = "Software\Microsoft\Windows\CurrentVersion\Privacy"; Name = "TailoredExperiencesWithDiagnosticDataEnabled"; Value = 0; Type = "DWord" },
     @{ Path = "Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo"; Name = "Enabled"; Value = 0; Type = "DWord" }
 )
 
-# 1. Update the "Default" profile for all NEW users created in the future
-$defaultHivePath = "$env:SystemDrive\Users\Default\NTUSER.DAT"
-reg load HKU\DefaultUser $defaultHivePath
-foreach ($setting in $RegistrySettings) {
-    $keyPath = "HKU:\DefaultUser\$($setting.Path)"
-    if (-not (Test-Path $keyPath)) { New-Item -Path $keyPath -Force }
-    Set-ItemProperty -Path $keyPath -Name $setting.Name -Value $setting.Value -Type $setting.Type
+# 2. Function to apply settings with full path and setting output
+function Apply-RegistrySettings($rootPath, $profileDisplayName) {
+    Write-Host "`n[+] Processing Profile: $profileDisplayName" -ForegroundColor Cyan
+    
+    foreach ($setting in $RegistrySettings) {
+        $fullPath = "$rootPath\$($setting.Path)"
+        
+        if (-not (Test-Path $fullPath)) { 
+            New-Item -Path $fullPath -Force | Out-Null 
+        }
+        
+        Write-Host "    Path:    $fullPath" -ForegroundColor DarkGray
+        Write-Host "    Setting: $($setting.Name) = $($setting.Value) ($($setting.Type))" -ForegroundColor Gray
+        
+        New-ItemProperty -Path $fullPath -Name $setting.Name -Value $setting.Value -PropertyType $setting.Type -Force | Out-Null
+    }
 }
-[gc]::Collect() # Trigger garbage collection to help release the file lock
-reg unload HKU\DefaultUser
+
+# 3. Update the "Default" profile (Future Users)
+Write-Host "--- Modifying Default User Hive ---" -ForegroundColor Yellow
+$defaultHivePath = "$env:SystemDrive\Users\Default\NTUSER.DAT"
+
+Write-Host "[*] Action: Loading Default User hive..." -ForegroundColor Magenta
+reg load HKU\DefaultUser $defaultHivePath | Out-Null
+
+Apply-RegistrySettings "HKU:\DefaultUser" "Default User Template"
+
+[gc]::Collect()
+Write-Host "[*] Action: Unloading Default User hive..." -ForegroundColor Magenta
+reg unload HKU\DefaultUser | Out-Null
+
+# 4. Update Existing Profiles (Active & Offline)
+Write-Host "`n--- Modifying Existing User Profiles ---" -ForegroundColor Yellow
+$PatternSID = 'S-1-5-21-\d+-\d+\-\d+\-\d+$'
+$profiles = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\*' | 
+            Where-Object { $_.PSChildName -match $PatternSID }
+
+foreach ($profile in $profiles) {
+    $sid = $profile.PSChildName
+    $userName = Split-Path $profile.ProfileImagePath -Leaf
+    
+    if (Test-Path "HKU:\$sid") {
+        # User is active; no load/unload needed
+        Apply-RegistrySettings "HKU:\$sid" "${userName} (Active/Logged In)"
+    } else {
+        $hivePath = "$($profile.ProfileImagePath)\NTUSER.DAT"
+        if (Test-Path $hivePath) {
+            Write-Host "[*] Action: Loading hive for ${userName}..." -ForegroundColor Magenta
+            reg load "HKU\$sid" $hivePath | Out-Null
+            
+            Apply-RegistrySettings "HKU:\$sid" "${userName} (Offline Hive)"
+            
+            [gc]::Collect()
+            Start-Sleep -Milliseconds 200
+            
+            Write-Host "[*] Action: Unloading hive for ${userName}..." -ForegroundColor Magenta
+            reg unload "HKU\$sid" | Out-Null
+        } else {
+            Write-Host "[!] Skipping ${userName}: NTUSER.DAT not found." -ForegroundColor Red
+        }
+    }
+}
+
+Write-Host "`n[SUCCESS] Settings applied to all user profiles." -ForegroundColor Green
 
 # ----------------------------------------------------------------------------------------------------------------------
 
